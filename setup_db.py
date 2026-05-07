@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS geocode_failures (
     city TEXT,
     county TEXT,
     state TEXT DEFAULT 'MI',
+    address_key TEXT NOT NULL UNIQUE,
     reason TEXT,
     resolved INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,

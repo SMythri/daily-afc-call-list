@@ -1,8 +1,10 @@
 import os
+import re
 import pandas as pd
 import streamlit as st
 from db import get_connection
 from process_ranches import process_ranch_csv
+from distance import haversine_miles, miles_to_feet, classify_distance
 
 
 DISPOSITIONS = [
@@ -97,6 +99,7 @@ def load_geocode_failures():
         city,
         county,
         state,
+        address_key,
         reason,
         created_at
     FROM geocode_failures
@@ -256,6 +259,189 @@ def render_leads():
         st.success("Lead updated.")
         st.rerun()
 
+def normalize_address_key(address: str, city: str = "", state: str = "MI") -> str:
+    raw = f"{address} {city} {state}".lower().strip()
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def load_afc_homes_for_app(conn):
+    return conn.execute(
+        """
+        SELECT id, address, city, latitude, longitude
+        FROM afc_homes
+        WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
+        """
+    ).fetchall()
+
+
+def find_nearest_afc_for_app(ranch_lat, ranch_lon, afc_homes):
+    nearest = None
+    nearest_distance = None
+
+    for afc in afc_homes:
+        distance_miles = haversine_miles(
+            ranch_lat,
+            ranch_lon,
+            afc["latitude"],
+            afc["longitude"],
+        )
+
+        if nearest_distance is None or distance_miles < nearest_distance:
+            nearest = afc
+            nearest_distance = distance_miles
+
+    return nearest, nearest_distance
+
+
+def save_manual_geocode_resolution(issue_id: int, latitude: float, longitude: float):
+    conn = get_connection()
+
+    issue = conn.execute(
+        """
+        SELECT *
+        FROM geocode_failures
+        WHERE id = ?;
+        """,
+        (issue_id,),
+    ).fetchone()
+
+    if not issue:
+        conn.close()
+        raise RuntimeError("Geocode issue not found.")
+
+    afc_homes = load_afc_homes_for_app(conn)
+
+    if not afc_homes:
+        conn.close()
+        raise RuntimeError("No AFC homes found. Import AFC homes first.")
+
+    address_key = issue["address_key"]
+
+    conn.execute(
+        """
+        INSERT INTO ranch_listings (
+            mls, stat, property_type, area, address, city, county,
+            price, dom, beds_total, baths, sqft,
+            latitude, longitude, address_key,
+            first_seen, last_seen, updated_at
+        )
+        VALUES (?, '', '', '', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, CURRENT_DATE, CURRENT_DATE, CURRENT_TIMESTAMP)
+        ON CONFLICT(address_key) DO UPDATE SET
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            last_seen = CURRENT_DATE,
+            updated_at = CURRENT_TIMESTAMP;
+        """,
+        (
+            issue["mls"],
+            issue["address"],
+            issue["city"],
+            issue["county"],
+            float(latitude),
+            float(longitude),
+            address_key,
+        ),
+    )
+
+    ranch = conn.execute(
+        """
+        SELECT *
+        FROM ranch_listings
+        WHERE address_key = ?;
+        """,
+        (address_key,),
+    ).fetchone()
+
+    nearest_afc, distance_miles = find_nearest_afc_for_app(
+        latitude,
+        longitude,
+        afc_homes,
+    )
+
+    if not nearest_afc:
+        conn.close()
+        raise RuntimeError("Could not find nearest AFC.")
+
+    distance_feet = miles_to_feet(distance_miles)
+    tier = classify_distance(distance_miles)
+
+    nearest_afc_id = nearest_afc["id"]
+    nearest_afc_address = f"{nearest_afc['address']}, {nearest_afc['city']}"
+
+    if tier == "Kill":
+        conn.execute(
+            """
+            INSERT INTO discarded_ranches (
+                ranch_address_key, ranch_listing_id, nearest_afc_id,
+                nearest_afc_address, distance_feet, distance_miles,
+                reason, first_seen, last_seen, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_DATE, CURRENT_DATE, CURRENT_TIMESTAMP)
+            ON CONFLICT(ranch_address_key) DO UPDATE SET
+                nearest_afc_id = excluded.nearest_afc_id,
+                nearest_afc_address = excluded.nearest_afc_address,
+                distance_feet = excluded.distance_feet,
+                distance_miles = excluded.distance_miles,
+                reason = excluded.reason,
+                last_seen = CURRENT_DATE,
+                updated_at = CURRENT_TIMESTAMP;
+            """,
+            (
+                address_key,
+                ranch["id"],
+                nearest_afc_id,
+                nearest_afc_address,
+                distance_feet,
+                distance_miles,
+                "Within 1,500 ft Kill Zone",
+            ),
+        )
+
+    elif tier in ["Green", "Yellow", "Red"]:
+        conn.execute(
+            """
+            INSERT INTO leads (
+                ranch_address_key, ranch_listing_id, nearest_afc_id,
+                nearest_afc_address, distance_feet, distance_miles,
+                tier, status, disposition, first_seen, last_seen, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Active', 'New', CURRENT_DATE, CURRENT_DATE, CURRENT_TIMESTAMP)
+            ON CONFLICT(ranch_address_key) DO UPDATE SET
+                ranch_listing_id = excluded.ranch_listing_id,
+                nearest_afc_id = excluded.nearest_afc_id,
+                nearest_afc_address = excluded.nearest_afc_address,
+                distance_feet = excluded.distance_feet,
+                distance_miles = excluded.distance_miles,
+                tier = excluded.tier,
+                status = 'Active',
+                last_seen = CURRENT_DATE,
+                updated_at = CURRENT_TIMESTAMP;
+            """,
+            (
+                address_key,
+                ranch["id"],
+                nearest_afc_id,
+                nearest_afc_address,
+                distance_feet,
+                distance_miles,
+                tier,
+            ),
+        )
+
+    conn.execute(
+        """
+        UPDATE geocode_failures
+        SET resolved = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?;
+        """,
+        (issue_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return tier, distance_miles
 
 def render_geocode_issues():
     st.header("Geocode Issues")
@@ -267,11 +453,68 @@ def render_geocode_issues():
         return
 
     st.write(
-        "These Ranch addresses could not be converted into latitude/longitude. "
-        "They were not included in lead distance calculations."
+        "These Ranch addresses could not be automatically converted into latitude/longitude. "
+        "You can manually enter coordinates to process them."
     )
 
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Resolve Geocode Issue")
+
+    issue_ids = df["id"].tolist()
+    selected_issue_id = st.selectbox("Select Issue ID", issue_ids)
+
+    selected = df[df["id"] == selected_issue_id].iloc[0]
+
+    st.write(f"**MLS:** {selected['mls']}")
+    st.write(f"**Address:** {selected['address']}, {selected['city']}, {selected['state']}")
+    st.write(f"**County:** {selected['county']}")
+    st.write(f"**Reason:** {selected['reason']}")
+
+    latitude = st.number_input(
+        "Latitude",
+        value=0.0,
+        format="%.8f",
+        help="Example: 42.2808256",
+    )
+
+    longitude = st.number_input(
+        "Longitude",
+        value=0.0,
+        format="%.8f",
+        help="Example: -83.7430378",
+    )
+
+    if st.button("Save Coordinates and Process"):
+        if latitude == 0.0 or longitude == 0.0:
+            st.error("Please enter valid latitude and longitude.")
+            return
+
+        try:
+            tier, distance_miles = save_manual_geocode_resolution(
+                selected_issue_id,
+                latitude,
+                longitude,
+            )
+
+            if tier == "Ignore":
+                st.success(
+                    f"Coordinates saved. Property is more than 5 miles from nearest AFC, so it was ignored."
+                )
+            elif tier == "Kill":
+                st.success(
+                    f"Coordinates saved. Property is inside the Kill Zone and was moved to Discarded."
+                )
+            else:
+                st.success(
+                    f"Coordinates saved. Property was processed as a {tier} lead "
+                    f"at {distance_miles:.2f} miles."
+                )
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not resolve geocode issue: {e}")
 
 
 def render_discarded():

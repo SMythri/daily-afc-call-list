@@ -81,18 +81,29 @@ def save_geocode_failure(conn, row, reason: str):
     if not address:
         return
 
+    address_key = normalize_address_key(address, city)
+
     conn.execute(
         """
         INSERT INTO geocode_failures (
-            mls, address, city, county, state, reason, resolved, updated_at
+            mls, address, city, county, state, address_key, reason, resolved, updated_at
         )
-        VALUES (?, ?, ?, ?, 'MI', ?, 0, CURRENT_TIMESTAMP);
+        VALUES (?, ?, ?, ?, 'MI', ?, ?, 0, CURRENT_TIMESTAMP)
+        ON CONFLICT(address_key) DO UPDATE SET
+            mls = excluded.mls,
+            address = excluded.address,
+            city = excluded.city,
+            county = excluded.county,
+            reason = excluded.reason,
+            resolved = 0,
+            updated_at = CURRENT_TIMESTAMP;
         """,
         (
             str(mls),
             str(address),
             str(city),
             str(county),
+            address_key,
             reason,
         ),
     )
