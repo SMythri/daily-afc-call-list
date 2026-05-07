@@ -222,43 +222,6 @@ def render_leads():
 
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    st.subheader("Update Lead")
-
-    lead_ids = filtered["lead_id"].tolist()
-
-    if not lead_ids:
-        st.info("No leads match the selected filters.")
-        return
-
-    selected_lead_id = st.selectbox("Select Lead ID", lead_ids)
-
-    selected = filtered[filtered["lead_id"] == selected_lead_id].iloc[0]
-
-    st.write(f"**Address:** {selected['address']}, {selected['city']}")
-    st.write(f"**Tier:** {selected['tier']}")
-    st.write(f"**Distance:** {selected['distance_miles']} miles")
-    st.write(f"**Nearest AFC:** {selected['nearest_afc_address']}")
-
-    current_disposition = selected["disposition"]
-    disposition_index = (
-        DISPOSITIONS.index(current_disposition)
-        if current_disposition in DISPOSITIONS
-        else 0
-    )
-
-    new_disposition = st.selectbox(
-        "Disposition",
-        DISPOSITIONS,
-        index=disposition_index,
-    )
-
-    new_notes = st.text_area("Notes", value=selected["notes"] or "")
-
-    if st.button("Save Lead Update"):
-        update_lead(selected_lead_id, new_disposition, new_notes)
-        st.success("Lead updated.")
-        st.rerun()
-
 def normalize_address_key(address: str, city: str = "", state: str = "MI") -> str:
     raw = f"{address} {city} {state}".lower().strip()
     raw = re.sub(r"[^a-z0-9]+", " ", raw)
