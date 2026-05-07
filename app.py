@@ -2,7 +2,6 @@ import os
 import pandas as pd
 import streamlit as st
 from db import get_connection
-from auth import require_login
 from process_ranches import process_ranch_csv
 
 
@@ -296,9 +295,6 @@ def main():
         page_title="Daily AFC CallList",
         layout="wide",
     )
-
-    if not require_login():
-        return
 
     st.title("Daily AFC CallList Engine")
 
